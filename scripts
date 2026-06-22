@@ -1,0 +1,952 @@
+# =============================================================
+# CO2 FLUX ANALYSIS – PADDY SEASON (NEP, DT + NT, FULL PIPELINE)
+# =============================================================
+
+library(tidyverse)
+library(lubridate)
+library(REddyProc)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(broom)
+library(zoo)
+library(reshape2)
+library(patchwork)
+windowsFonts(Times = windowsFont("Times New Roman"))
+
+theme_set(
+  theme_bw(base_size = 14, base_family = "Times") +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 14),
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 14),
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      strip.text = element_text(size = 14)
+    )
+)
+# =============================================================
+# USER SETTINGS
+# =============================================================
+
+infile <- "data/workfile.csv"
+output_dir <- "outputs"
+
+start_dt <- as.POSIXct("2024-07-20 00:00:00", tz = "UTC")
+end_dt   <- as.POSIXct("2024-11-15 23:59:59", tz = "UTC")
+
+# ---------------- PHENOLOGY ----------------
+pheno_tbl <- tibble(
+  phase = factor(
+    c("Transplanting","Vegetative","Reproductive","Maturity"),
+    levels = c("Transplanting","Vegetative","Reproductive","Maturity")
+  ),
+  start = as.Date(c("2024-07-20","2024-08-11","2024-09-16","2024-10-16")),
+  end   = as.Date(c("2024-08-10","2024-09-15","2024-10-15","2024-11-16"))
+)
+
+# =============================================================
+# STEP 1: READ + TRUE NEE
+# =============================================================
+
+df <- read_csv(infile, show_col_types = FALSE) %>%
+  mutate(
+    Date = dmy(date),
+    DateTime = as.POSIXct(paste(Date, time), tz = "UTC"),
+    NEE = ifelse(qc_co2_flux == 0, co2_flux + co2_strg, NA_real_),
+    Tair = Tair - 273.15,
+    VPD  = VPD / 100,
+    Year = year(DateTime),
+    DoY  = yday(DateTime),
+    Hour = hour(DateTime) + minute(DateTime)/60
+  ) %>%
+  filter(DateTime >= start_dt & DateTime <= end_dt)
+
+# ---------------- Physical filters ----------------
+df <- df %>%
+  mutate(
+    NEE   = ifelse(NEE < -50 | NEE > 50, NA, NEE),
+    Rg    = ifelse(Rg < 0 | Rg > 1200, NA, Rg),
+    VPD   = ifelse(VPD <= 0, NA, VPD),
+    Tair  = ifelse(Tair < -10 | Tair > 60, NA, Tair),
+    Ustar = ifelse(Ustar < 0 | Ustar > 3, NA, Ustar)
+  )
+
+
+# =============================================================
+# STEP 2: REGULAR TIME GRID
+# =============================================================
+
+data_full <- tibble(
+  DateTime = seq(min(df$DateTime), max(df$DateTime), by = "30 min")
+) %>%
+  left_join(df, by = "DateTime") %>%
+  mutate(
+    Year = year(DateTime),
+    DoY  = yday(DateTime),
+    Hour = hour(DateTime) + minute(DateTime)/60
+  ) %>%
+  select(DateTime, Year, DoY, Hour, NEE, Rg, Tair, VPD, Ustar)
+
+
+# =============================================================
+# STEP 3: REddyProc (CORRECT ORDER)
+# =============================================================
+
+EProc <- sEddyProc$new(
+  "PaddySite",
+  data_full,
+  ColNames = c("Year","DoY","Hour","NEE","Rg","Tair","VPD","Ustar"),
+  DTS = 48
+)
+
+EProc$sSetLocationInfo(22.31, 87.31, 5)
+
+# ---- GAP FILLING ----
+EProc$sEstimateUstarScenarios(probs = c(0.05, 0.5, 0.95))
+EProc$sMDSGapFillUStarScens("NEE")
+EProc$sMDSGapFill("Rg",   FillAll = TRUE)
+EProc$sMDSGapFill("VPD",  FillAll = TRUE)
+EProc$sMDSGapFill("Tair", FillAll = TRUE)
+
+# ---- PARTITIONING ----
+EProc$sGLFluxPartitionUStarScens()
+EProc$sMRFluxPartitionUStarScens(debug = list(fixedE0 = -120))
+EProc$sPlotNEEVersusUStarForSeason()
+# =============================================================
+# EXPORT + NEP
+# =============================================================
+
+Filled <- EProc$sExportResults() %>%
+  mutate(
+    DateTime = data_full$DateTime,
+    Date     = as.Date(DateTime),
+    NEP      = -NEE_U50_f
+  ) %>%
+  left_join(pheno_tbl, by = join_by(Date >= start, Date <= end)) %>%
+  mutate(phase = factor(phase))
+
+# ---- derive NT GPP if available ----
+if ("Reco_NT_U50" %in% names(Filled)) {
+  Filled <- Filled %>%
+    mutate(GPP_NT_U50 = Reco_NT_U50 - NEE_U50_f)
+}
+
+# ---- day/night flag ----
+Filled <- Filled %>%
+  mutate(DayFlag = ifelse(Rg_f > 10, "Day", "Night"))
+
+write_csv(
+  Filled,
+  output_dir
+)
+
+
+# =============================================================
+# 1–2. DRIVER TIME SERIES (HH + DAILY, SHADED)
+# =============================================================
+
+add_pheno_shade <- function() {
+  geom_rect(
+    data = pheno_tbl,
+    aes(xmin = as.POSIXct(start), xmax = as.POSIXct(end),
+        ymin = -Inf, ymax = Inf, fill = phase),
+    inherit.aes = FALSE,
+    alpha = 0.18
+  )
+}
+
+plot_ts <- function(df, var, title) {
+  ggplot(df, aes(DateTime, .data[[var]])) +
+    add_pheno_shade() +
+    geom_line(colour = "#1f78b4", linewidth = 0.6) +
+    scale_fill_brewer(
+      palette = "Set2",
+      name = "Phase",
+      limits = c("Transplanting","Vegetative","Reproductive","Maturity")
+    ) +
+    labs(title = title, x = "Date", y = var)
+}
+
+ggsave("TS_HH_Tair.png", plot_ts(Filled,"Tair_f","Half-hourly Tair"), width = 12,
+       height = 4,
+       dpi = 150)
+ggsave("TS_HH_VPD.png",  plot_ts(Filled,"VPD_f","Half-hourly VPD"), width = 12,
+       height = 4,
+       dpi = 150)
+ggsave("TS_HH_Rg.png",   plot_ts(Filled,"Rg_f","Half-hourly Rg"), width = 12,
+       height = 4,
+       dpi = 150)
+
+daily_drv <- Filled %>%
+  group_by(Date) %>%
+  summarise(
+    Tair = mean(Tair_f, na.rm=TRUE),
+    VPD  = mean(VPD_f, na.rm=TRUE),
+    Rg   = mean(Rg_f,  na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  rename(DateTime = Date)
+
+ggsave("TS_Daily_Tair.png", plot_ts(daily_drv,"Tair","Daily Mean Tair"),width = 12,
+       height = 4,
+       dpi = 150)
+ggsave("TS_Daily_VPD.png",  plot_ts(daily_drv,"VPD","Daily Mean VPD"),width = 12,
+       height = 4,
+       dpi = 150)
+ggsave("TS_Daily_Rg.png",   plot_ts(daily_drv,"Rg","Daily Mean Rg"),width = 12,
+       height = 4,
+       dpi = 150)
+
+# =============================================================
+# 3. NEP WITH DATA GAPS
+# =============================================================
+
+nep_raw <- df %>% select(DateTime, NEE) %>%
+  mutate(NEP = -NEE)
+
+nep_interp <- nep_raw %>%
+  mutate(NEP_i = na.approx(NEP, x = DateTime, na.rm = FALSE))
+
+nep_miss <- nep_interp %>% filter(is.na(NEP))
+
+p_nep_gap <- ggplot() +
+  add_pheno_shade() +
+  geom_line(data = nep_raw, aes(DateTime, NEP), colour="#1F78B4") +
+  geom_point(data = nep_miss, aes(DateTime, NEP_i),
+             shape=21, fill="white", colour="red", size=0.6) +
+  labs(title="Half-hourly NEP with Data Gaps",
+       y=expression(NEP~(mu*mol~m^{-2}~s^{-1})))
+
+ggsave("NEP_Gaps.png", p_nep_gap, width = 12,
+       height = 4,
+       dpi = 150)
+
+# =============================================================
+# NIGHT-TIME PARTITIONED NEE vs U* (DIAGNOSTIC — CORRECT)
+# =============================================================
+# =============================================================
+# ADD Ustar FROM data_full TO Filled
+# =============================================================
+
+Filled <- Filled %>%
+  left_join(
+    data_full %>% select(DateTime, Ustar),
+    by = "DateTime"
+  )
+
+
+p_ustar_nee <- Filled %>%
+  filter(
+    Rg_f <= 10,
+    !is.na(NEE_U50_f),  # Original good NEE
+    !is.na(Ustar),
+    Ustar <= 0.5
+  ) %>%
+  ggplot(aes(Ustar, NEE_U50_f)) +
+  geom_point(alpha = 0.4, size = 1, colour = "black") +
+  geom_smooth(method = "loess", se = TRUE, colour = "#D73027", linewidth = 1) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "blue", linewidth = 1) +
+  labs(
+    title = "Raw Night-time NEE vs U* (Diagnostic)",
+    subtitle = "Pre-partitioning, for threshold check",
+    x = expression(U*" (m s"^{-1}*")"),
+    y = expression(NEE[night]~(mu*mol~m^{-2}~s^{-1}))
+  )
+
+ggsave("NEE_night_vs_Ustar_Raw.png", p_ustar_nee, width = 8, height = 5, dpi = 150)
+
+# Built-in REddyProc plot (binned, seasonal)
+EProc$sPlotNEEVersusUStarForSeason()  # Opens interactive plot(s)
+
+
+
+# =============================================================
+# DIURNAL BOXPLOTS — NIGHT-TIME (REddyProc NT VARIABLES)
+# =============================================================
+
+plot_flux_diurnal_nt <- function(df) {
+  
+  df %>%
+    mutate(
+      Hour = lubridate::hour(DateTime)
+    ) %>%
+    
+    # Use NIGHT-TIME partitioning outputs only
+    select(
+      Hour,
+      FP_NEEnight_U50,
+      Reco_U50,
+      GPP_U50_f
+    ) %>%
+    
+    pivot_longer(
+      cols = c(FP_NEEnight_U50, Reco_U50, GPP_U50_f),
+      names_to = "Flux",
+      values_to = "Value"
+    ) %>%
+    
+    drop_na() %>%
+    
+    ggplot(aes(factor(Hour), Value, fill = Flux)) +
+    geom_boxplot(outlier.alpha = 0.25) +
+    labs(
+      title = "Night-time Diurnal Variation (NT Partitioning)",
+      x = "Hour of day",
+      y = expression(mu*mol~m^{-2}~s^{-1}),
+      fill = "Flux"
+    )
+}
+
+ggsave(
+  filename = "Diurnal_Fluxes_Boxplot_Night_NT.png",
+  plot = plot_flux_diurnal_nt(Filled),
+  width = 12,
+  height = 5,
+  dpi = 150
+)
+
+
+
+# =============================================================
+# 5–6. FLUX TIME SERIES + DIURNAL BOXPLOTS (NEP)
+# =============================================================
+
+plot_flux_ts <- function(df) {
+  ggplot(df, aes(DateTime)) +
+    add_pheno_shade() +
+    geom_line(aes(y = NEP, colour = "NEP")) +
+    geom_line(aes(y = GPP_DT_U50, colour = "GPP")) +
+    geom_line(aes(y = Reco_DT_U50, colour = "RE")) +
+    scale_colour_manual(
+      name = "Flux type",
+      values = c(
+        "NEP" = "black",
+        "GPP" = "#1A9850",
+        "RE"  = "#D73027"
+      )
+    )
+}
+
+ggsave("TS_Fluxes_All.png", plot_flux_ts(Filled),width = 12,
+       height = 5,
+       dpi = 150)
+
+plot_flux_diurnal <- function(df) {
+  df %>%
+    mutate(Hour = hour(DateTime)) %>%
+    pivot_longer(
+      c(NEP, GPP_DT_U50, Reco_DT_U50),
+      names_to = "Flux",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Flux = recode(
+        Flux,
+        "NEP" = "NEP",
+        "GPP_DT_U50" = "GPP",
+        "Reco_DT_U50" = "RE"
+      )
+    ) %>%
+    ggplot(aes(factor(Hour), Value, fill = Flux)) +
+    geom_boxplot(outlier.alpha = 0.25) +
+    labs(fill = "Flux type")
+}
+
+ggsave("Diurnal_Fluxes_Boxplot.png", plot_flux_diurnal(Filled),width = 12,
+       height = 5,
+       dpi = 150)
+# =============================================================
+# DIURNAL BOXPLOTS — ALL FLUXES BY GROWTH STAGE
+# =============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+
+plot_diurnal_flux_by_stage <- function(df) {
+  
+  df %>%
+    mutate(
+      Hour = hour(DateTime)
+    ) %>%
+    select(
+      Hour,
+      phase,
+      NEP,
+      GPP_DT_U50,
+      Reco_DT_U50
+    ) %>%
+    pivot_longer(
+      cols = c(NEP, GPP_DT_U50, Reco_DT_U50),
+      names_to = "Flux",
+      values_to = "Value"
+    ) %>%
+    
+    # ---- FIX LEGEND LABELS ----
+  mutate(
+    Flux = recode(
+      Flux,
+      "NEP" = "NEP",
+      "GPP_DT_U50" = "GPP",
+      "Reco_DT_U50" = "RE"
+    )
+  ) %>%
+    
+    ggplot(
+      aes(
+        factor(Hour),
+        Value,
+        fill = Flux
+      )
+    ) +
+    
+    geom_boxplot(outlier.alpha = 0.25) +
+    
+    facet_wrap(~ phase, scales = "free_y") +
+    
+    scale_fill_manual(
+      name = "Flux type",
+      values = c(
+        "NEP" = "#542902",
+        "GPP" = "#1A9850",
+        "RE"  = "#D80007"
+      )
+    ) +
+    
+    labs(
+      title = "Diurnal Variation of NEP, GPP, and RE by Growth Stage",
+      x = "Hour of day",
+      y = expression(mu*mol~m^{-2}~s^{-1})
+    )
+}
+
+ggsave(
+  filename = "Diurnal_Boxplots_All_Fluxes_By_Phase.png",
+  plot = plot_diurnal_flux_by_stage(Filled),
+  width = 14,
+  height = 6,
+  dpi = 150
+)
+
+# =============================================================
+# 9. CORRELATION MATRIX (DAYTIME)
+# =============================================================
+
+cor_df <- Filled %>%
+  filter(DayFlag=="Day") %>%
+  select(NEP, GPP_DT_U50, Reco_DT_U50, Rg_f, Tair_f, VPD_f)
+
+cor_mat <- cor(cor_df, use="complete.obs")
+
+ggsave(
+  "Correlation_Matrix.png",
+  ggplot(melt(cor_mat), aes(Var1,Var2,fill=value)) +
+    geom_tile() +
+    geom_text(aes(label=round(value,2)), family="Times", size=3.5) +
+    scale_fill_gradient2(limits=c(-1,1)) +
+    theme_bw(),
+  width = 7,
+  height = 6
+)
+
+
+
+
+
+
+
+
+
+
+library(randomForest)
+library(caret)
+library(broom)
+library(pdp)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# -------------------------------------------------------------
+# DATA FOR MODELLING
+# -------------------------------------------------------------
+ml_df <- Filled %>%
+  select(DateTime, NEP, Rg_f, Tair_f, VPD_f, phase) %>%
+  drop_na()
+
+train_idx <- createDataPartition(ml_df$NEP, p = 0.8, list = FALSE)
+train <- ml_df[train_idx, ]
+test  <- ml_df[-train_idx, ]
+
+# -------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------
+lm_mod <- lm(NEP ~ Rg_f + Tair_f + VPD_f + phase, data = train)
+rf_mod <- randomForest(
+  NEP ~ Rg_f + Tair_f + VPD_f + phase,
+  data = train,
+  ntree = 800,
+  importance = TRUE
+)
+
+# -------------------------------------------------------------
+# PREDICTIONS
+# -------------------------------------------------------------
+pred_df <- tibble(
+  Observed = test$NEP,
+  LM = predict(lm_mod, test),
+  RF = predict(rf_mod, test)
+)
+
+lm_r2 <- R2(pred_df$LM, pred_df$Observed)
+rf_r2 <- R2(pred_df$RF, pred_df$Observed)
+
+# =============================================================
+# 1. OBSERVED vs PREDICTED — LINEAR MODEL
+# =============================================================
+
+p_lm <- ggplot(pred_df, aes(Observed, LM)) +
+  
+  # Reference axes (dotted)
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  
+  geom_point(alpha = 0.6, colour = "#4575B4") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Observed vs Predicted NEP — Linear Model",
+    subtitle = paste("Test R² =", round(lm_r2, 2)),
+    x = "Observed NEP",
+    y = "Predicted NEP"
+  )
+
+ggsave(
+  "Observed_vs_Predicted_NEP_LM.png",
+  p_lm,
+  width = 6,
+  height = 5,
+  dpi = 150
+)
+
+
+# =============================================================
+# 2. OBSERVED vs PREDICTED — RANDOM FOREST
+# =============================================================
+
+p_rf <- ggplot(pred_df, aes(Observed, RF)) +
+  
+  # Reference axes (dotted)
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  
+  geom_point(alpha = 0.6, colour = "#D73027") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  
+  labs(
+    title = "Observed vs Predicted NEP — Random Forest",
+    subtitle = paste("Test R² =", round(rf_r2, 2)),
+    x = "Observed NEP",
+    y = "Predicted NEP"
+  )
+
+ggsave(
+  "Observed_vs_Predicted_NEP_RF.png",
+  p_rf,
+  width = 6,
+  height = 5,
+  dpi = 150
+)
+
+
+# =============================================================
+# 3. LINEAR MODEL SENSITIVITY (NORMALISED COEFFICIENTS)
+# =============================================================
+
+train_lm_norm <- train %>%
+  mutate(
+    Rg_f   = scale(Rg_f),
+    Tair_f = scale(Tair_f),
+    VPD_f  = scale(VPD_f)
+  )
+
+lm_norm <- lm(NEP ~ Rg_f + Tair_f + VPD_f + phase, data = train_lm_norm)
+
+lm_sens <- tidy(lm_norm) %>%
+  filter(term %in% c("Rg_f","Tair_f","VPD_f")) %>%
+  mutate(term = recode(term,
+                       Rg_f   = "Rg",
+                       Tair_f = "Tair",
+                       VPD_f  = "VPD"))
+
+p_lm_sens <- ggplot(lm_sens, aes(term, estimate)) +
+  geom_col(fill = "#4575B4", width = 0.6) +
+  labs(
+    title = "Normalised Linear Sensitivity (NEP)",
+    x = "Driver",
+    y = "Standardised coefficient"
+  )
+
+ggsave("LM_Sensitivity_NEP.png", p_lm_sens, width = 6, height = 4, dpi = 150)
+
+
+# =============================================================
+# 4. RANDOM FOREST DRIVER IMPORTANCE (NORMALISED BAR)
+# =============================================================
+
+train_rf_norm <- train %>%
+  mutate(
+    Rg_f   = scale(Rg_f),
+    Tair_f = scale(Tair_f),
+    VPD_f  = scale(VPD_f)
+  )
+
+rf_norm <- randomForest(
+  NEP ~ Rg_f + Tair_f + VPD_f + phase,
+  data = train_rf_norm,
+  ntree = 800,
+  importance = TRUE
+)
+
+rf_imp <- importance(rf_norm) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable %in% c("Rg_f","Tair_f","VPD_f")) %>%
+  mutate(
+    Variable = recode(
+      Variable,
+      Rg_f   = "Rg",
+      Tair_f = "Tair",
+      VPD_f  = "VPD"
+    )
+  )
+
+p_rf_bar <- ggplot(rf_imp, aes(Variable, IncNodePurity)) +
+  geom_col(fill = "#1B7837", width = 0.6) +
+  labs(
+    title = "RF Driver Importance (NEP)",
+    y = "Importance",
+    x = "Driver"
+  )
+
+ggsave("RF_Partial_Dependence_NEP.png", p_rf_bar, width = 6, height = 4, dpi = 150)
+
+
+# =============================================================
+# 5. DIURNAL SENSITIVITY BY GROWTH STAGE — LM AND RF (SEPARATE)
+# =============================================================
+
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(lubridate)
+library(tidyr)
+
+# -------------------------------------------------------------
+# Diurnal aggregation
+# -------------------------------------------------------------
+diurnal_df <- ml_df %>%
+  mutate(Hour = hour(DateTime)) %>%
+  group_by(phase, Hour) %>%
+  summarise(
+    NEP  = mean(NEP, na.rm = TRUE),
+    Rg   = mean(Rg_f, na.rm = TRUE),
+    Tair = mean(Tair_f, na.rm = TRUE),
+    VPD  = mean(VPD_f, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -------------------------------------------------------------
+# Fit models per growth stage
+# -------------------------------------------------------------
+fit_phase_models <- function(df) {
+  
+  df <- df %>%
+    mutate(
+      Rg   = scale(Rg),
+      Tair = scale(Tair),
+      VPD  = scale(VPD)
+    )
+  
+  lm_m <- lm(NEP ~ Rg + Tair + VPD, data = df)
+  rf_m <- randomForest(NEP ~ Rg + Tair + VPD, data = df, ntree = 500)
+  
+  tibble(
+    Variable = c("Rg","Tair","VPD"),
+    LM = coef(lm_m)[c("Rg","Tair","VPD")],
+    RF = importance(rf_m)[c("Rg","Tair","VPD"),"IncNodePurity"]
+  )
+}
+
+sens_diurnal <- diurnal_df %>%
+  group_by(phase) %>%
+  group_modify(~ fit_phase_models(.x)) %>%
+  ungroup()
+# =============================================================
+# A. LINEAR MODEL — DIURNAL SENSITIVITY
+# =============================================================
+
+p_lm_diurnal <- ggplot(
+  sens_diurnal,
+  aes(Variable, LM)
+) +
+  geom_col(fill = "#4575B4", width = 0.6) +
+  facet_wrap(~ phase, scales = "free_y") +
+  labs(
+    title = "Diurnal NEP Sensitivity by Growth Stage — Linear Model",
+    y = "Linear sensitivity (slope)",
+    x = "Driver"
+  )
+
+ggsave(
+  "Diurnal_Sensitivity_LM_By_Phase.png",
+  p_lm_diurnal,
+  width = 12,
+  height = 6,
+  dpi = 150
+)
+
+# =============================================================
+# B. RANDOM FOREST — DIURNAL SENSITIVITY (RAW IMPORTANCE)
+# =============================================================
+library(ggh4x)
+
+sens_rf <- sens_diurnal %>%
+  select(phase, Variable, RF)
+
+# ---- derive per-phase limits ----
+ylims_tbl <- sens_rf %>%
+  group_by(phase) %>%
+  summarise(
+    ymin = floor(min(RF, na.rm = TRUE) * 0.8),
+    ymax = ceiling(max(RF, na.rm = TRUE) * 1.05),
+    .groups = "drop"
+  )
+
+# ---- create named list for facet-wise limits ----
+y_scales <- lapply(
+  split(ylims_tbl, ylims_tbl$phase),
+  function(lim) scale_y_continuous(limits = c(lim$ymin, lim$ymax))
+)
+
+p_rf_diurnal <- ggplot(
+  sens_rf,
+  aes(Variable, RF)
+) +
+  geom_col(fill = "#D73027", width = 0.6) +
+  ggh4x::facet_wrap2(~ phase, scales = "free_y") +
+  ggh4x::facetted_pos_scales(
+    y = y_scales
+  ) +
+  labs(
+    title = "Diurnal NEP Sensitivity by Growth Stage — Random Forest",
+    y = "Variable importance (IncNodePurity)",
+    x = "Driver"
+  )
+
+ggsave(
+  "Diurnal_Sensitivity_RF_By_Phase.png",
+  p_rf_diurnal,
+  width = 12,
+  height = 6,
+  dpi = 150
+)
+
+
+
+
+
+
+
+
+#reco and gpp comparison
+# =============================================================
+# DAILY AGGREGATION — DAY vs NIGHT PARTITIONING
+# =============================================================
+
+library(dplyr)
+library(ggplot2)
+
+compare_df <- Filled %>%
+  group_by(Date) %>%
+  summarise(
+    # Respiration
+    Reco_DT = mean(Reco_DT_U50, na.rm = TRUE),   # Daytime partitioning
+    Reco_NT = mean(Reco_U50,    na.rm = TRUE),   # Night-time partitioning
+    
+    # GPP
+    GPP_DT  = mean(GPP_DT_U50,  na.rm = TRUE),   # Daytime partitioning
+    GPP_NT  = mean(GPP_U50_f,   na.rm = TRUE),   # Night-time partitioning
+    
+    .groups = "drop"
+  ) %>%
+  drop_na()
+p_reco <- ggplot(compare_df, aes(Reco_DT, Reco_NT)) +
+  geom_point(alpha = 0.6, colour = "#4575B4") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  labs(
+    title = "Reco: Daytime vs Night-time Partitioning (Daily Mean)",
+    x = "Reco — Daytime partitioning",
+    y = "Reco — Night-time partitioning"
+  )
+
+ggsave(
+  "Reco_DT_vs_NT.png",
+  p_reco,
+  width = 6,
+  height = 5,
+  dpi = 150
+)
+p_gpp <- ggplot(compare_df, aes(GPP_DT, GPP_NT)) +
+  geom_point(alpha = 0.6, colour = "#1A9850") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  labs(
+    title = "GPP: Daytime vs Night-time Partitioning (Daily Mean)",
+    x = "GPP — Daytime partitioning",
+    y = "GPP — Night-time partitioning"
+  )
+
+ggsave(
+  "GPP_DT_vs_NT.png",
+  p_gpp,
+  width = 6,
+  height = 5,
+  dpi = 150
+)
+
+
+
+
+# =============================================================
+# 15–20. FUNCTIONAL RELATIONSHIPS (NEP: DAILY + DAYTIME)
+# =============================================================
+
+library(ggplot2)
+library(dplyr)
+
+# -------------------------------------------------------------
+# Helper function: functional relationship plot
+# -------------------------------------------------------------
+plot_func <- function(df, x, y, title, filter_rg = FALSE) {
+  
+  plot_df <- df
+  
+  if (filter_rg && x == "Rg") {
+    plot_df <- plot_df %>% filter(Rg > 10)
+  }
+  
+  ggplot(plot_df, aes(.data[[x]], .data[[y]])) +
+    geom_point(alpha = 0.4, colour = "#1B7837") +
+    geom_smooth(method = "loess", se = TRUE, colour = "black") +
+    labs(
+      title = title,
+      x = x,
+      y = y
+    )
+}
+
+# =============================================================
+# A. DAILY MEAN DATA (9 PLOTS)
+# =============================================================
+
+daily_flux <- Filled %>%
+  group_by(Date) %>%
+  summarise(
+    NEP  = mean(NEP,         na.rm = TRUE),
+    GPP  = mean(GPP_DT_U50,  na.rm = TRUE),
+    Reco = mean(Reco_DT_U50, na.rm = TRUE),
+    Rg   = mean(Rg_f,        na.rm = TRUE),
+    Tair = mean(Tair_f,      na.rm = TRUE),
+    VPD  = mean(VPD_f,       na.rm = TRUE),
+    .groups = "drop"
+  )
+
+responses <- c("NEP", "GPP", "Reco")
+drivers   <- c("Rg", "Tair", "VPD")
+
+for (y in responses) {
+  for (x in drivers) {
+    
+    ggsave(
+      filename = paste0("Daily_", y, "_vs_", x, ".png"),
+      plot = plot_func(
+        df = daily_flux,
+        x  = x,
+        y  = y,
+        title = paste("Daily Mean", y, "vs", x),
+        filter_rg = TRUE
+      ),
+      width  = 6,
+      height = 4,
+      dpi    = 150
+    )
+  }
+}
+
+# =============================================================
+# B. DAYTIME MEAN DATA (9 PLOTS)
+# =============================================================
+
+daytime_flux <- Filled %>%
+  filter(DayFlag == "Day") %>%
+  group_by(Date) %>%
+  summarise(
+    NEP  = mean(NEP,         na.rm = TRUE),
+    GPP  = mean(GPP_DT_U50,  na.rm = TRUE),
+    Reco = mean(Reco_DT_U50, na.rm = TRUE),
+    Rg   = mean(Rg_f,        na.rm = TRUE),
+    Tair = mean(Tair_f,      na.rm = TRUE),
+    VPD  = mean(VPD_f,       na.rm = TRUE),
+    .groups = "drop"
+  )
+
+for (y in responses) {
+  for (x in drivers) {
+    
+    ggsave(
+      filename = paste0("Daytime_", y, "_vs_", x, ".png"),
+      plot = plot_func(
+        df = daytime_flux,
+        x  = x,
+        y  = y,
+        title = paste("Daytime Mean", y, "vs", x),
+        filter_rg = TRUE
+      ),
+      width  = 6,
+      height = 4,
+      dpi    = 150
+    )
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
